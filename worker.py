@@ -13,7 +13,7 @@ protocol goes to stderr, never stdout.
 
 Engine: faster-whisper (CTranslate2). It decodes webm/opus itself through PyAV,
 so no ffmpeg is needed on PATH. Runs in its own venv (~/.dsh/dictation-venv),
-so it never disturbs any other Python on the machine.
+addressed by absolute path -- never whatever `python` happens to be on PATH.
 
 Device: CPU int8 by default -- fast enough for dictation with `small`, and it
 cannot collide with anything using the GPU. Set DSH_DICTATION_DEVICE=cuda to try
@@ -56,24 +56,26 @@ def load(model_name):
     raise RuntimeError(f"could not load model {model_name}: {last}")
 
 
-def transcribe(audio_path, model_name):
+def transcribe(audio_path, model_name, fast=False):
+    """fast=True is for LIVE CAPTIONS: greedy decoding (beam 1), because the
+    caption is redone a second later anyway; the committed text uses beam 5."""
     model, device = load(model_name)
     t0 = time.time()
     try:
         # vad_filter drops silence up front: Whisper hallucinates ("You", "Thank
-        # you.") on empty audio, which is exactly the failure the Mac hit.
-        segments, info = model.transcribe(audio_path, beam_size=5, vad_filter=True)
+        # you.") on empty audio, which is a common failure mode.
+        segments, info = model.transcribe(audio_path, beam_size=1 if fast else 5, vad_filter=True)
         text = " ".join(s.text.strip() for s in segments).strip()
     except Exception as exc:  # noqa: BLE001
-        # A GPU model can LOAD and still fail at inference (seen on Windows when
-        # cublas64_12.dll is missing). Switch to CPU for good and retry once,
+        # A GPU model can LOAD and still fail at inference (seen on Windows
+        # when cublas64_12.dll is missing). Switch to CPU for good and retry once,
         # rather than failing every dictation from here on.
         if device != "cuda":
             raise
         log(f"cuda inference failed ({exc}); switching to CPU")
         os.environ["DSH_DICTATION_DEVICE"] = "cpu"
         _models.pop(model_name, None)
-        return transcribe(audio_path, model_name)
+        return transcribe(audio_path, model_name, fast)
     return {
         "text": text,
         "seconds": round(time.time() - t0, 2),
@@ -96,7 +98,14 @@ def main():
         try:
             req = json.loads(line)
             req_id = req.get("id")
-            result = transcribe(req["audio"], req.get("model") or DEFAULT_MODEL)
+            if req.get("warm"):
+                # Load models ahead of the first caption, so it is not the one
+                # that waits for a model load.
+                for name in req["warm"]:
+                    load(name)
+                print(json.dumps({"id": req_id, "ok": True, "warmed": req["warm"]}), flush=True)
+                continue
+            result = transcribe(req["audio"], req.get("model") or DEFAULT_MODEL, bool(req.get("fast")))
             print(json.dumps({"id": req_id, "ok": True, **result}), flush=True)
         except Exception as exc:  # noqa: BLE001 -- one bad clip must not kill the worker
             log(f"request failed: {exc}")

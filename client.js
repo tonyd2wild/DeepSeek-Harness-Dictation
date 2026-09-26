@@ -12,27 +12,34 @@
  *   structural: Chrome's SpeechRecognition is NOT on-device. It ships the audio
  *   to Google, and an Electron build without Google's API keys cannot complete
  *   that round-trip. It worked in a real Chrome window and failed in the app —
- *   the same page, the same code, which is exactly the symptom reported.
+ *   the same page, the same code.
  *
  *   So this version takes Google out of the path entirely:
  *     getUserMedia -> MediaRecorder (webm/opus) -> POST to
- *     /api/dictation/transcribe -> local openai-whisper -> text into composer.
+ *     /api/dictation/transcribe -> local faster-whisper -> text into composer.
  *
  *   Nothing leaves the machine, no API key is involved, and it behaves
  *   identically in the Electron shell, in Chrome, and fully offline.
  *
- * CLICK TO RECORD, CLICK AGAIN TO TRANSCRIBE
- *   Continuous streaming would need chunked uploads and mid-sentence stitching.
- *   For dictation, click-to-stop is honest about what it does and can never
- *   mis-splice two phrases.
+ * LIVE STREAMING INTO THE MESSAGE BOX (v2)
+ *   v1 was "click to record, click again to transcribe". v2 streams: words
+ *   appear in the composer and grow in place while you talk, each phrase is
+ *   finalised at a natural pause, and a long silence stops listening. See
+ *   "the dictation engine" below for how phrases are cut and how the box is
+ *   edited without touching text the human typed.
  *
- * INSERTION IS LAYERED, ON PURPOSE
- *   Writing into another package's composer is the fragile part. Three
- *   strategies are tried in order and the first that reports success wins:
- *     1. The session event bus: "slash/input-insert-text".
- *     2. Focus the composer and use document.execCommand("insertText").
- *     3. Native value setter + a dispatched "input" event on the contenteditable.
- *   A status line reports which path ran, so a failure is visible, not silent.
+ * VOICE MODE
+ *   A second button runs a hands-free conversation: it sends (or steers) after
+ *   a quiet spell and cooperates with the companion read-aloud plugin through
+ *   window.__dshVoice. See "voice mode" below.
+ *
+ * INSERTION
+ *   Writing into another package's composer is the fragile part. The engine
+ *   selects the stretch it owns and uses document.execCommand("insertText");
+ *   if that is refused it falls back to the native value setter plus a
+ *   dispatched "input" event, so React still sees the change. The v1 layered
+ *   helpers (session event bus "slash/input-insert-text", then execCommand,
+ *   then the native setter) are still defined below.
  *
  * @module dsh-plugin-dictation/client
  */
@@ -193,294 +200,720 @@ window.__ModuleLoader__.load({
 			});
 		}
 
-		// ── the button ───────────────────────────────────────────────────────
+		// ── the dictation engine ─────────────────────────────────────────────
 		/**
-		 * Push-to-dictate control for the composer's right-hand cluster.
+		 * Hands-free dictation that streams STRAIGHT INTO THE MESSAGE BOX.
+		 * Shared by the mic button (dictate, you press Send) and the voice-mode
+		 * button (conversation: it sends after a pause and reads the reply aloud).
 		 *
-		 * Click to record, click again to stop and transcribe.
+		 * While you talk, your words appear in the message box and grow in place
+		 * (re-recognised about every 0.7 s, so the newest words may correct
+		 * themselves). At each natural pause the phrase is finalised in place.
+		 * A longer silence (autoStopMs) ends the listening.
+		 *
+		 * HOW THE BOX IS EDITED
+		 *   The harness composer is a plain controlled <textarea>. The engine keeps
+		 *   track of the stretch of text IT wrote and updates only that stretch:
+		 *   select the part that changed and execCommand("insertText"), exactly
+		 *   what a person selecting text and typing over it does, so the harness's
+		 *   own state follows along (and undo works). Text the human typed outside
+		 *   that stretch is never touched; if they edit inside it mid-dictation,
+		 *   the engine stops owning that text and carries on from the caret.
+		 *
+		 * HOW PHRASES ARE CUT
+		 *   A MediaRecorder only yields a decodable file from its own start, so each
+		 *   phrase is its own recorder on the same microphone stream, recording in
+		 *   400 ms slices. The slices so far always form a decodable (unterminated)
+		 *   webm, which the live pass transcribes. At a pause the recorder is
+		 *   stopped, the whole phrase is transcribed once more (beam search) and
+		 *   replaces the live text in place, and a new recorder starts at once.
+		 *
+		 * PAUSE DETECTION
+		 *   Room level = the 20th percentile of the last ~3 s; speech is judged
+		 *   against it, so a noise-suppressed, auto-gained mic still shows pauses.
 		 */
-		function DictationButton(props) {
-			var kit = props || {};
-			var sessionEvents = kit.events || kit.sessionEvents || null;
+		var PAUSE_MS = 650;          // silence that ends a phrase
+		var MAX_PHRASE_MS = 12000;   // force a cut in a long unbroken run
+		var TICK_MS = 80;            // voice-activity check interval
+		var LIVE_EVERY_MS = 700;     // live re-recognition interval
+		var SLICE_MS = 400;          // recorder slice length
+		var FINAL_MODEL = "base.en"; // "small" is more robust to accents/noise but ~5x slower on CPU
+		var WARM_PATH = "/api/dictation/warm";
+		var warmRequested = false;
 
+		function warmOnce() {
+			if (warmRequested) return;
+			warmRequested = true;
+			fetch(WARM_PATH, { method: "POST" }).catch(function () { warmRequested = false; });
+		}
+
+		/** Transcribe a blob with explicit options (fast = live pass). */
+		function transcribeWith(blob, opts) {
+			return blobToBase64(blob).then(function (audio) {
+				return fetch(TRANSCRIBE_PATH, {
+					method: "POST",
+					headers: { "content-type": "application/json" },
+					body: JSON.stringify(Object.assign({ audio: audio, mime: blob.type }, opts || {}))
+				});
+			}).then(function (r) {
+				return r.json().catch(function () { return null; }).then(function (body) {
+					if (!r.ok || !body || body.ok !== true) throw new Error((body && body.error) || ("transcription failed (HTTP " + r.status + ")"));
+					return body;
+				});
+			});
+		}
+
+		var HALLUCINATIONS = ["you", "you.", "thank you", "thank you.", "thanks for watching!", "thanks for watching.", "bye.", "bye"];
+		function isHallucination(text, seconds) {
+			return seconds < 2.5 && HALLUCINATIONS.indexOf(String(text).trim().toLowerCase()) >= 0;
+		}
+
+		/** Replace [from, to) of a textarea the way a person would: select, type over. */
+		function replaceRange(el, from, to, text) {
+			el.focus({ preventScroll: true });
+			el.setSelectionRange(from, to);
+			var ok = false;
+			try {
+				ok = text ? document.execCommand("insertText", false, text) : document.execCommand("delete", false);
+			} catch (e) { ok = false; }
+			if (!ok) {
+				// Fallback: native setter + input event (React still sees it).
+				var v = el.value;
+				var desc = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value");
+				desc.set.call(el, v.slice(0, from) + text + v.slice(to));
+				el.setSelectionRange(from + text.length, from + text.length);
+				el.dispatchEvent(new Event("input", { bubbles: true, composed: true }));
+			}
+		}
+
+		/**
+		 * Make the stretch this dictation owns read `desired`, changing only the
+		 * part that differs so the caret and the rest of the text stay put.
+		 */
+		function writeOwned(live, desired) {
+			var el = live.box && document.contains(live.box) ? live.box : findComposer();
+			if (!el || typeof el.setSelectionRange !== "function") return false;
+			if (el !== live.box) {
+				// First write (or the composer was re-mounted): anchor at the caret.
+				live.box = el;
+				live.anchor = typeof el.selectionEnd === "number" ? el.selectionEnd : el.value.length;
+				live.written = "";
+				live.lead = live.anchor > 0 && !/\s$/.test(el.value.slice(0, live.anchor)) ? " " : "";
+			}
+			var cur = el.value;
+			if (cur.substr(live.anchor, live.written.length) !== live.written) {
+				// The human edited inside our stretch (or the box was sent/cleared):
+				// leave it to them and carry on from wherever the caret is now.
+				live.anchor = typeof el.selectionEnd === "number" ? el.selectionEnd : cur.length;
+				live.written = "";
+				live.lead = live.anchor > 0 && !/\s$/.test(cur.slice(0, live.anchor)) ? " " : "";
+				live.parts = [];
+				desired = live.phrase && live.phrase.text ? live.phrase.text : "";
+			}
+			var target = desired ? live.lead + desired : "";
+			var common = 0;
+			var max = Math.min(target.length, live.written.length);
+			while (common < max && target.charCodeAt(common) === live.written.charCodeAt(common)) common++;
+			if (common === target.length && common === live.written.length) return true;
+			replaceRange(el, live.anchor + common, live.anchor + live.written.length, target.slice(common));
+			live.written = target;
+			return true;
+		}
+
+		/**
+		 * Start listening. Returns a controller: { stop(), setMuted(bool) }.
+		 *
+		 * hooks: onListening(bool), onPending(n), onError(msg),
+		 *        onEnd({ said })     -- after listening stopped AND every phrase is final
+		 *        filter(text, final) -- optional; return "" to drop a phrase (echo filter)
+		 *        onUtterance()       -- CONTINUOUS mode: you went quiet for sendAfterMs
+		 *                               after saying something and every phrase is final;
+		 *                               the text is in the box, ready to send. Listening
+		 *                               carries on and the next words start a new stretch.
+		 * opts:  autoStopMs  -- silence that ends the listening (dictation mode)
+		 *        continuous  -- never stop on silence; call onUtterance instead
+		 *        sendAfterMs -- the silence that counts as "done talking" (continuous)
+		 */
+		function startDictation(hooks, opts) {
+			var h = hooks || {};
+			var o = opts || {};
+			var continuous = !!o.continuous;
+			var autoStopMs = o.autoStopMs || 5000;
+			var sendAfterMs = o.sendAfterMs || 5000;
+			var filter = h.filter || function (t) { return t; };
+			var live = {
+				stream: null, mime: pickMimeType(), parts: [], stopped: false, ended: false, muted: false,
+				phrase: null, timer: null, liveTimer: null, audioCtx: null,
+				lastVoiceAt: Date.now(), levels: [], said: false,
+				box: null, anchor: 0, written: "", lead: ""
+			};
+
+			function pendingCount() { return live.parts.filter(function (p) { return !p.done; }).length; }
+
+			function maybeEnd() {
+				if (!live.stopped || live.ended || pendingCount() > 0) return;
+				live.ended = true;
+				if (h.onEnd) h.onEnd({ said: live.said });
+			}
+
+			function render() {
+				var texts = live.parts.map(function (p) { return p.text; });
+				if (live.phrase && live.phrase.text) texts.push(live.phrase.text);
+				var desired = texts.filter(Boolean).join(" ");
+				if (desired) live.said = true;
+				if (!writeOwned(live, desired) && h.onError) h.onError("Could not reach the message box");
+				if (h.onPending) h.onPending(pendingCount());
+			}
+
+			/** Continuous mode: the stretch was sent; the next words start a new one. */
+			function newStretch() {
+				live.parts = [];
+				live.box = null;
+				live.written = "";
+				live.said = false;
+			}
+
+			function refreshLive() {
+				var p = live.phrase;
+				if (!p || !p.hadSpeech || p.busy || !p.chunks.length) return;
+				p.busy = true;
+				var blob = new Blob(p.chunks.slice(), { type: live.mime || "audio/webm" });
+				transcribeWith(blob, { fast: true }).then(function (body) {
+					var text = (body.text || "").trim();
+					if (live.phrase === p && !p.closed && !isHallucination(text, (Date.now() - p.startedAt) / 1000)) {
+						p.text = filter(text, false);
+						render();
+					}
+				}).catch(function () { /* a missed live pass is harmless; the final pass still comes */ })
+					.then(function () { p.busy = false; });
+			}
+
+			function startPhrase() {
+				var rec = live.mime ? new MediaRecorder(live.stream, { mimeType: live.mime }) : new MediaRecorder(live.stream);
+				var p = { rec: rec, chunks: [], startedAt: Date.now(), hadSpeech: false, text: "", busy: false, closed: false, done: false };
+				rec.ondataavailable = function (ev) { if (ev.data && ev.data.size > 0) p.chunks.push(ev.data); };
+				rec.onstop = function () {
+					p.closed = true;
+					if (!p.hadSpeech || !p.chunks.length) { maybeEnd(); return; }
+					var seconds = (Date.now() - p.startedAt) / 1000;
+					// The phrase keeps its place in the box; its live text stays
+					// visible until the final pass replaces it.
+					live.parts.push(p);
+					render();
+					transcribeWith(new Blob(p.chunks, { type: live.mime || "audio/webm" }), { model: FINAL_MODEL })
+						.then(function (body) {
+							var text = (body.text || "").trim();
+							p.text = isHallucination(text, seconds) ? "" : filter(text, true);
+						})
+						.catch(function (e) {
+							// Keep what the live pass heard rather than losing the phrase.
+							if (!p.text && h.onError) h.onError("Transcription failed: " + (e && e.message ? e.message : e));
+						})
+						.then(function () { p.done = true; render(); maybeEnd(); });
+				};
+				rec.start(SLICE_MS);
+				live.phrase = p;
+			}
+
+			function cutPhrase(andContinue) {
+				var p = live.phrase;
+				live.phrase = null;
+				if (p) { try { p.rec.stop(); } catch (e) { /* already stopped */ } }
+				if (andContinue && !live.stopped) startPhrase();
+			}
+
+			function stop() {
+				if (live.stopped) return;
+				live.stopped = true;
+				clearInterval(live.timer);
+				clearInterval(live.liveTimer);
+				var hadPhrase = !!live.phrase;
+				cutPhrase(false);
+				try { live.stream && live.stream.getTracks().forEach(function (t) { t.stop(); }); } catch (e) { /* released */ }
+				try { live.audioCtx && live.audioCtx.close(); } catch (e) { /* fine */ }
+				if (h.onListening) h.onListening(false);
+				if (!hadPhrase) maybeEnd();   // otherwise the recorder's onstop ends it
+			}
+
+			/** Mute: the mic delivers silence (tracks disabled) and the current phrase is finished. */
+			function setMuted(m) {
+				live.muted = !!m;
+				try { live.stream && live.stream.getAudioTracks().forEach(function (t) { t.enabled = !live.muted; }); } catch (e) { /* fine */ }
+				if (live.muted && live.phrase && live.phrase.hadSpeech) cutPhrase(true);
+			}
+
+			if (!canRecord()) {
+				if (h.onError) h.onError("This browser cannot record audio");
+				live.stopped = true;
+				setTimeout(maybeEnd, 0);
+				return { stop: function () {}, setMuted: function () {} };
+			}
+
+			navigator.mediaDevices.getUserMedia({
+				audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
+			}).then(function (stream) {
+				if (live.stopped) { stream.getTracks().forEach(function (t) { t.stop(); }); maybeEnd(); return; }
+				live.stream = stream;
+				if (live.muted) setMuted(true);
+				var AC = window.AudioContext || window.webkitAudioContext;
+				live.audioCtx = new AC();
+				var analyser = live.audioCtx.createAnalyser();
+				analyser.fftSize = 1024;
+				live.audioCtx.createMediaStreamSource(stream).connect(analyser);
+				var buf = new Float32Array(analyser.fftSize);
+
+				startPhrase();
+				if (h.onListening) h.onListening(true);
+
+				live.timer = setInterval(function () {
+					analyser.getFloatTimeDomainData(buf);
+					var sum = 0;
+					for (var i = 0; i < buf.length; i++) sum += buf[i] * buf[i];
+					var rms = Math.sqrt(sum / buf.length);
+					live.levels.push(rms);
+					if (live.levels.length > 40) live.levels.shift();
+					var sorted = live.levels.slice().sort(function (a, b) { return a - b; });
+					var floor = sorted[Math.floor(sorted.length * 0.2)] || 0;
+					var speaking = !live.muted && rms > Math.max(0.008, floor * 2.5 + 0.003);
+					var now = Date.now();
+					var p = live.phrase;
+					if (speaking) {
+						live.lastVoiceAt = now;
+						if (p) p.hadSpeech = true;
+					}
+					var quietFor = now - live.lastVoiceAt;
+					if (p && p.hadSpeech && (quietFor >= PAUSE_MS || now - p.startedAt >= MAX_PHRASE_MS)) cutPhrase(true);
+					if (!continuous) {
+						if (quietFor >= autoStopMs) stop();
+						return;
+					}
+					// Continuous: done talking = quiet long enough, nothing still
+					// being recorded or finalised, and something was actually said.
+					var p2 = live.phrase;
+					if (live.said && quietFor >= sendAfterMs && !(p2 && p2.hadSpeech) && pendingCount() === 0) {
+						var fire = h.onUtterance;
+						newStretch();
+						if (fire) fire();
+					}
+				}, TICK_MS);
+
+				live.liveTimer = setInterval(refreshLive, LIVE_EVERY_MS);
+			}).catch(function (e) {
+				var name = e && e.name;
+				var m = (name === "NotAllowedError" || name === "SecurityError") ? "Microphone blocked — allow it for this app"
+					: (name === "NotFoundError" || name === "DevicesNotFoundError") ? "No microphone found"
+					: "Microphone error: " + (name || e);
+				if (h.onError) h.onError(m);
+				live.stopped = true;
+				if (h.onListening) h.onListening(false);
+				maybeEnd();
+			});
+
+			return { stop: stop, setMuted: setMuted };
+		}
+
+		// ── the voice-mode bus (shared with dsh-plugin-speech) ───────────────
+		/**
+		 * window.__dshVoice, created by whichever plugin loads first (same shape
+		 * in both). Fields:
+		 *   mode          -- voice mode is on
+		 *   muted         -- voice mode's mic is muted
+		 *   awaitingReply -- a message was sent; read the next finished reply aloud
+		 *   speaking      -- a reply is being read aloud right now
+		 *   speakingText  -- what is being read (the echo filter compares against it)
+		 * Events: "mode", "mute", "speaking", "spoken", "stop-speaking".
+		 */
+		function voiceBus() {
+			if (!window.__dshVoice) {
+				window.__dshVoice = {
+					mode: false,
+					awaitingReply: false,
+					listeners: new Set(),
+					on: function (fn) { this.listeners.add(fn); var self = this; return function () { self.listeners.delete(fn); }; },
+					emit: function (type) { this.listeners.forEach(function (fn) { try { fn(type); } catch (e) {} }); }
+				};
+			}
+			var b = window.__dshVoice;
+			if (b.muted === undefined) b.muted = false;
+			if (b.speaking === undefined) b.speaking = false;
+			if (b.speakingText === undefined) b.speakingText = "";
+			return b;
+		}
+
+		/** Re-render a component whenever the voice bus says something. */
+		function useVoiceBus() {
+			var bus = voiceBus();
+			var tick = useState(0);
+			useEffect(function () {
+				return bus.on(function () { tick[1](function (n) { return n + 1; }); });
+			}, []);
+			return bus;
+		}
+
+		// ── shared bits for both buttons ─────────────────────────────────────
+
+		function useFadingMessage() {
+			var st = useState(null);
+			useEffect(function () {
+				if (!st[0]) return;
+				var t = setTimeout(function () { st[1](null); }, 5000);
+				return function () { clearTimeout(t); };
+			}, [st[0]]);
+			return st;
+		}
+
+		function hintBubble(msg) {
+			return msg ? h("span", {
+				style: {
+					position: "absolute",
+					bottom: "calc(100% + 6px)",
+					right: 0,
+					whiteSpace: "nowrap",
+					fontSize: 11,
+					lineHeight: "16px",
+					padding: "2px 7px",
+					borderRadius: 6,
+					color: "#ffd0d0",
+					background: "rgba(20,22,28,.92)",
+					border: "1px solid rgba(255,255,255,.09)",
+					pointerEvents: "none",
+					maxWidth: 320,
+					overflow: "hidden",
+					textOverflow: "ellipsis",
+					zIndex: 5
+				}
+			}, msg) : null;
+		}
+
+		function micIcon(slashed) {
+			return h("svg", {
+				width: 16, height: 16, viewBox: "0 0 24 24", fill: "none",
+				stroke: "currentColor", strokeWidth: 2, strokeLinecap: "round", strokeLinejoin: "round",
+				"aria-hidden": "true"
+			},
+				h("rect", { x: 9, y: 3, width: 6, height: 11, rx: 3 }),
+				h("path", { d: "M5 11a7 7 0 0 0 14 0" }),
+				h("path", { d: "M12 18v3" }),
+				slashed ? h("path", { d: "M3 3l18 18" }) : null
+			);
+		}
+
+		function roundButton(extra) {
+			return Object.assign({
+				display: "inline-flex",
+				alignItems: "center",
+				justifyContent: "center",
+				width: 28,
+				height: 28,
+				padding: 0,
+				border: "none",
+				borderRadius: 999,
+				cursor: "pointer",
+				transition: "background .15s, box-shadow .15s"
+			}, extra || {});
+		}
+
+		// ── the mic button: dictate, then you press Send ────────────────────
+		// In voice mode it becomes the MUTE button for voice mode's mic.
+
+		function DictationButton() {
+			var bus = useVoiceBus();
 			var recording = useState(false);
 			var isRec = recording[0];
 			var setRec = recording[1];
-
-			var busy = useState(false);
-			var isBusy = busy[0];
-			var setBusy = busy[1];
-
-			var status = useState(null);
+			var pendingState = useState(0);
+			var pending = pendingState[0];
+			var status = useFadingMessage();
 			var msg = status[0];
 			var setMsg = status[1];
-			// A finished hint ("Inserted via …", "Heard nothing", an error) used to
-			// stay on screen until the next dictation -- nothing ever cleared it.
-			// In-progress hints stay; anything else fades after a few seconds.
-			useEffect(function () {
-				if (!msg || /^(Recording|Waiting|Transcribing)/.test(msg)) return;
-				var t = setTimeout(function () { setMsg(null); }, 4000);
-				return function () { clearTimeout(t); };
-			}, [msg]);
+			var ctlRef = useRef(null);
 
-			var streamRef = useRef(null);
-			var recorderRef = useRef(null);
-			var chunksRef = useRef([]);
-			var startedRef = useRef(0);
-			var levelTimerRef = useRef(null);
-			var peakRef = useRef(0);
-
-			/** Release the microphone. Track-based, so the OS indicator clears. */
-			var releaseMic = useCallback(function () {
-				try {
-					if (streamRef.current) {
-						var tracks = streamRef.current.getTracks();
-						for (var i = 0; i < tracks.length; i++) tracks[i].stop();
-					}
-				} catch (e) { /* already released */ }
-				streamRef.current = null;
-			}, []);
-
-			/** Stop recording; the recorder's onstop uploads and inserts. */
-			var finish = useCallback(function () {
-				var rec = recorderRef.current;
-				if (!rec) return;
-				try { rec.stop(); } catch (e) { /* already stopped */ }
-			}, []);
-
-			/** Start recording. */
-			var begin = useCallback(function () {
-				if (!canRecord()) {
-					setMsg("This browser cannot record audio");
-					return;
-				}
-				setMsg("Waiting for the microphone…");
-
-				navigator.mediaDevices.getUserMedia({
-					audio: {
-						// Dictation, not music: speech-tuned processing helps a lot
-						// and whisper copes with it fine.
-						echoCancellation: true,
-						noiseSuppression: true,
-						autoGainControl: true
-					}
-				}).then(function (stream) {
-					streamRef.current = stream;
-					chunksRef.current = [];
-					var mime = pickMimeType();
-					var rec = mime ? new MediaRecorder(stream, { mimeType: mime }) : new MediaRecorder(stream);
-					recorderRef.current = rec;
-					startedRef.current = Date.now();
-
-					// ── live level meter ─────────────────────────────────────────
-					// This exists to make the failure VISIBLE. If the mic is
-					// delivering silence, a peak of 0.000 during recording says so
-					// immediately, instead of leaving us to infer it from a
-					// hallucinated transcript after the fact.
-					var audioCtx = null;
-					var peak = 0;
-					try {
-						var AC = window.AudioContext || window.webkitAudioContext;
-						if (AC) {
-							audioCtx = new AC();
-							var src = audioCtx.createMediaStreamSource(stream);
-							var analyser = audioCtx.createAnalyser();
-							analyser.fftSize = 512;
-							src.connect(analyser);
-							var buf = new Float32Array(analyser.fftSize);
-							levelTimerRef.current = setInterval(function () {
-								try {
-									analyser.getFloatTimeDomainData(buf);
-									var local = 0;
-									for (var i = 0; i < buf.length; i++) {
-										var v = Math.abs(buf[i]);
-										if (v > local) local = v;
-									}
-									if (local > peak) peak = local;
-									peakRef.current = peak;
-									// A moving label, so the human can SEE it hearing them.
-									setMsg("Recording… level " + peak.toFixed(2)
-										+ (peak < 0.01 ? " (silent!)" : ""));
-								} catch (e) { /* meter is best-effort */ }
-							}, 250);
-						}
-					} catch (e) { /* no meter; recording still works */ }
-
-					rec.ondataavailable = function (ev) {
-						if (ev.data && ev.data.size > 0) chunksRef.current.push(ev.data);
-					};
-
-					rec.onstop = function () {
-						releaseMic();
-						if (levelTimerRef.current) {
-							clearInterval(levelTimerRef.current);
-							levelTimerRef.current = null;
-						}
-						var elapsed = (Date.now() - startedRef.current) / 1000;
-						var heardPeak = peakRef.current;
-						var blob = new Blob(chunksRef.current, { type: mime || "audio/webm" });
-						recorderRef.current = null;
-						chunksRef.current = [];
-						setRec(false);
-
-						if (blob.size === 0 || elapsed < 0.6) {
-							setMsg("Too short — hold on a moment longer");
-							return;
-						}
-
-						setBusy(true);
-						setMsg("Transcribing " + elapsed.toFixed(1) + "s locally…");
-						transcribe(blob).then(function (body) {
-							var text = (body.text || "").trim();
-							if (!text) { setMsg("Heard nothing — try again"); return; }
-
-							// Whisper hallucinates short common words on empty or
-							// near-empty audio; "You" and "Thank you." are the
-							// classic pair. Verified 2026-09-18: 0.5s of pure
-							// silence transcribes to exactly "You". If we get one
-							// of those from a very short recording, it is far more
-							// likely to be a silent capture than real speech, so
-							// say so instead of inserting a mystery word.
-							var HALLUCINATIONS = ["you", "thank you", "thank you.", "you."];
-							var suspect = elapsed < 2.5
-								&& HALLUCINATIONS.indexOf(text.toLowerCase()) >= 0;
-							if (suspect) {
-								setMsg("Heard nothing — is the mic picking you up?");
-								return;
-							}
-
-							var how = insertTranscript(sessionEvents, text);
-							// The peak is the honest signal: if the mic heard
-							// nothing, say so even when whisper invented a word.
-							var quiet = heardPeak < 0.01;
-							setMsg(how
-								? ("Inserted via " + how + (quiet ? " (mic level was very low)" : ""))
-								: "Could not reach the composer");
-						}).catch(function (e) {
-							setMsg("Transcription failed: " + (e && e.message ? e.message : e));
-						}).then(function () { setBusy(false); });
-					};
-
-					rec.start(1000);   // timeslice: flush every second
-					setRec(true);
-					setMsg("Recording… click again to stop");
-				}).catch(function (e) {
-					var name = e && e.name;
-					if (name === "NotAllowedError" || name === "SecurityError") {
-						setMsg("Microphone blocked — allow it for this app");
-					} else if (name === "NotFoundError" || name === "DevicesNotFoundError") {
-						setMsg("No microphone found");
-					} else {
-						setMsg("Microphone error: " + (name || e));
-					}
-					releaseMic();
-					setRec(false);
-				});
-			}, [sessionEvents, releaseMic]);
-
-			var toggle = useCallback(function () {
-				if (isBusy) return;
-				if (isRec) finish(); else begin();
-			}, [isBusy, isRec, begin, finish]);
-
-			// Release the mic if the button unmounts (session switch), so a hidden
-			// button can never hold the microphone open.
-			useEffect(function () {
-				return function () {
-					if (levelTimerRef.current) {
-						clearInterval(levelTimerRef.current);
-						levelTimerRef.current = null;
-					}
-					try { if (recorderRef.current) recorderRef.current.stop(); } catch (e) { /* fine */ }
-					releaseMic();
-				};
-			}, [releaseMic]);
+			useEffect(warmOnce, []);
+			useEffect(function () { return function () { if (ctlRef.current) ctlRef.current.stop(); }; }, []);
+			// Entering voice mode ends a dictation in progress: one mic at a time.
+			useEffect(function () { if (bus.mode && ctlRef.current) ctlRef.current.stop(); }, [bus.mode]);
 
 			var unsupported = !canRecord();
-			var tone = isRec ? "#ff6b6b" : (isBusy ? "#ffc46b" : "#8a93a3");
+			var keepFocus = function (e) { e.preventDefault(); };
 
+			if (bus.mode) {
+				var muted = bus.muted;
+				return h("span", { style: { position: "relative", display: "inline-flex", alignItems: "center" } },
+					h("button", {
+						type: "button",
+						onMouseDown: keepFocus,
+						onClick: function () { if (bus.setMuted) bus.setMuted(!muted); },
+						title: muted ? "Mic muted — voice mode stays on. Click to unmute." : "Mute the mic (voice mode stays on)",
+						"aria-label": muted ? "Unmute microphone" : "Mute microphone",
+						"aria-pressed": muted ? "true" : "false",
+						"data-voice-mute": muted ? "muted" : "live",
+						style: roundButton({
+							color: muted ? "#ffffff" : "#e6e9ef",
+							background: muted ? "#5b616e" : "rgba(255,255,255,.08)"
+						})
+					}, micIcon(muted)),
+					hintBubble(msg));
+			}
+
+			var toggle = function () {
+				if (ctlRef.current) { ctlRef.current.stop(); return; }
+				ctlRef.current = startDictation({
+					onListening: setRec,
+					onPending: pendingState[1],
+					onError: setMsg,
+					onEnd: function () { ctlRef.current = null; pendingState[1](0); }
+				}, { autoStopMs: 5000 });
+			};
+			var working = !isRec && pending > 0;
+
+			return h("span", { style: { position: "relative", display: "inline-flex", alignItems: "center" } },
+				h("button", {
+					type: "button",
+					// Keep focus (and the caret) in the message box when the mic is clicked.
+					onMouseDown: keepFocus,
+					onClick: unsupported ? undefined : toggle,
+					disabled: unsupported,
+					title: unsupported
+						? "Recording is not available in this browser"
+						: (isRec ? "Listening — pause 5 s or click to stop" : "Dictate (transcribed locally)"),
+					"aria-label": isRec ? "Stop dictating" : "Start dictating",
+					"aria-pressed": isRec ? "true" : "false",
+					style: roundButton({
+						cursor: unsupported ? "default" : "pointer",
+						color: isRec ? "#ffffff" : (working ? "#ffc46b" : "#8a93a3"),
+						background: isRec ? "#e5484d" : "transparent",
+						boxShadow: isRec ? "0 0 0 3px rgba(229,72,77,.28)" : (working ? "0 0 0 2px rgba(255,196,107,.45)" : "none"),
+						opacity: unsupported ? 0.4 : 1
+					})
+				}, micIcon(false)),
+				hintBubble(msg));
+		}
+
+		// ── voice mode: hands-free conversation ─────────────────────────────
+		/**
+		 * The round button on the far right of the input bar, like ChatGPT's.
+		 * While the message box is empty it stands where Send is (the harness's
+		 * Send button is hidden while disabled); once there is text it steps
+		 * aside, unless voice mode is on.
+		 *
+		 * Tap it and it turns RED and stays red -- the mic stays open -- until
+		 * you tap it again. Talk; when you go quiet for CONVO_SEND_AFTER_MS, what you said is
+		 * sent with Ctrl+Enter, the harness's own gesture: a new message when
+		 * the agent is idle, a STEER when it is busy. So you can talk while it
+		 * works or reads to you, and your words redirect it.
+		 *
+		 * Replies are read aloud automatically (dsh-plugin-speech). While one
+		 * is being read:
+		 *   - anything the mic picks up that matches the words being read is
+		 *     dropped (the mic hearing the speaker must never steer the agent);
+		 *   - real words of your own interrupt the reading, like ChatGPT.
+		 * The mic button becomes a mute button for as long as voice mode is on.
+		 */
+		var CONVO_SEND_AFTER_MS = 2000;   // quiet that sends what you said (2 s; raise it if it sends mid-thought)
+		var SEND_LABELS = ["Send message", "发送消息"];
+		var ECHO_GRACE_MS = 1500;         // the speaker's tail after reading stops
+
+		function findSendButton() {
+			for (var i = 0; i < SEND_LABELS.length; i++) {
+				var b = document.querySelector('button[aria-label="' + SEND_LABELS[i] + '"]');
+				if (b) return b;
+			}
+			return null;
+		}
+
+		/**
+		 * Send what is in the box: Ctrl+Enter on the composer, which the harness
+		 * resolves to a normal send when the agent is idle and to a steer when it
+		 * is busy. Falls back to the Send button if the box did not clear.
+		 */
+		function submitComposer() {
+			return new Promise(function (resolve) {
+				var el = findComposer();
+				if (!el) { resolve(false); return; }
+				var before = el.value;
+				el.dispatchEvent(new KeyboardEvent("keydown", {
+					key: "Enter", code: "Enter", keyCode: 13, which: 13, ctrlKey: true, bubbles: true, cancelable: true
+				}));
+				setTimeout(function () {
+					var now = findComposer();
+					if (!now || now.value !== before || !now.value.trim()) { resolve(true); return; }
+					var b = findSendButton();
+					if (b && !b.disabled) { b.click(); resolve(true); return; }
+					resolve(false);
+				}, 400);
+			});
+		}
+
+		var styleInjected = false;
+		function injectComposerStyle() {
+			if (styleInjected) return;
+			styleInjected = true;
+			var css = SEND_LABELS.map(function (l) { return 'button[aria-label="' + l + '"]:disabled'; }).join(",")
+				+ "{display:none!important}"
+				+ "@keyframes dshVoicePulse{0%{box-shadow:0 0 0 0 rgba(229,72,77,.55)}70%{box-shadow:0 0 0 9px rgba(229,72,77,0)}100%{box-shadow:0 0 0 0 rgba(229,72,77,0)}}";
+			var tag = document.createElement("style");
+			tag.setAttribute("data-plugin", "dsh-plugin-dictation");
+			tag.textContent = css;
+			document.head.appendChild(tag);
+		}
+
+		function composerEmpty() {
+			var el = findComposer();
+			return !el || !String(el.value || el.textContent || "").trim();
+		}
+
+		/** Words, lower-cased, no punctuation. */
+		function wordsOf(s) {
+			return String(s || "").toLowerCase().replace(/[^a-z0-9' ]+/g, " ").split(/\s+/).filter(Boolean);
+		}
+
+		/**
+		 * Is `text` the mic hearing the reply being read? True when most of its
+		 * words occur in what is being read. Short fragments count as echo too:
+		 * one or two words during a reading are too ambiguous to act on.
+		 */
+		function looksLikeEcho(text, reading) {
+			var w = wordsOf(text);
+			if (!w.length) return true;
+			var pool = new Set(wordsOf(reading));
+			var hits = w.filter(function (x) { return pool.has(x); }).length;
+			return w.length <= 2 || hits / w.length >= 0.6;
+		}
+
+		function VoiceModeButton() {
+			var bus = useVoiceBus();
+			var emptyState = useState(composerEmpty());
+			var empty = emptyState[0];
+			var status = useFadingMessage();
+			var msg = status[0];
+			var setMsg = status[1];
+			var ctlRef = useRef(null);
+			var rootRef = useRef(null);
+			var readingEndedAt = useRef(0);
+
+			useEffect(function () { injectComposerStyle(); warmOnce(); }, []);
+
+			// Sit at the far right of the input bar, where Send is.
+			useEffect(function () {
+				var el = rootRef.current;
+				var send = findSendButton();
+				if (!el || !send) return;
+				var node = el;
+				while (node.parentElement && !node.parentElement.contains(send)) node = node.parentElement;
+				if (node.parentElement) node.style.order = "99";
+			});
+
+			// Track whether the box is empty (that decides who owns the spot).
+			useEffect(function () {
+				var check = function () { emptyState[1](composerEmpty()); };
+				document.addEventListener("input", check, true);
+				var t = setInterval(check, 400);
+				return function () { document.removeEventListener("input", check, true); clearInterval(t); };
+			}, []);
+
+			// Remember when reading ended: the speaker's tail can still reach the mic.
+			useEffect(function () {
+				return bus.on(function (type) { if (type === "spoken") readingEndedAt.current = Date.now(); });
+			}, []);
+
+			var leave = useCallback(function () {
+				bus.mode = false;
+				bus.muted = false;
+				bus.awaitingReply = false;
+				bus.setMuted = null;
+				if (ctlRef.current) { var c = ctlRef.current; ctlRef.current = null; c.stop(); }
+				bus.emit("stop-speaking");
+				bus.emit("mode");
+			}, []);
+
+			var enter = useCallback(function () {
+				bus.mode = true;
+				bus.muted = false;
+				bus.awaitingReply = false;
+				ctlRef.current = startDictation({
+					onListening: function () {},
+					onError: function (m) { setMsg(m); },
+					onEnd: function () { if (bus.mode) leave(); },   // the mic went away
+					filter: function (text, final) {
+						var reading = bus.speaking || Date.now() - readingEndedAt.current < ECHO_GRACE_MS;
+						if (!reading) return text;
+						if (looksLikeEcho(text, bus.speakingText)) return "";
+						// Real words over the reading: interrupt it, like ChatGPT.
+						if (bus.speaking) bus.emit("stop-speaking");
+						return text;
+					},
+					onUtterance: function () {
+						// The next finished reply is read aloud; mark it before sending.
+						bus.awaitingReply = true;
+						submitComposer().then(function (ok) {
+							if (!ok) { bus.awaitingReply = false; setMsg("Could not send — press Enter"); }
+						});
+					}
+				}, { continuous: true, sendAfterMs: CONVO_SEND_AFTER_MS });
+				bus.setMuted = function (m) {
+					bus.muted = !!m;
+					if (ctlRef.current) ctlRef.current.setMuted(bus.muted);
+					bus.emit("mute");
+				};
+				bus.emit("mode");
+			}, [leave]);
+
+			useEffect(function () { return function () { if (bus.mode) leave(); }; }, [leave]);
+
+			var on = bus.mode;
+			if (!on && !empty) return h("span", { ref: rootRef, style: { display: "none" } });
+
+			var muted = on && bus.muted;
+			var bars = [4, 9, 13, 9, 4];
 			var button = h("button", {
 				type: "button",
-				onClick: unsupported ? undefined : toggle,
-				disabled: unsupported,
-				title: unsupported
-					? "Recording is not available in this browser"
-					: (isRec ? "Stop and transcribe" : "Dictate (recorded locally)"),
-				"aria-label": isRec ? "Stop and transcribe" : "Start dictating",
-				"aria-pressed": isRec ? "true" : "false",
-				style: {
-					display: "inline-flex",
-					alignItems: "center",
-					justifyContent: "center",
-					width: 28,
-					height: 28,
-					padding: 0,
-					border: "none",
-					borderRadius: 999,
-					cursor: unsupported ? "default" : "pointer",
-					opacity: unsupported ? 0.45 : 1,
-					color: tone,
-					background: isRec ? "rgba(255,107,107,.14)" : "transparent",
-					transition: "background .15s ease, color .15s ease",
-					boxShadow: isRec ? "0 0 8px rgba(255,107,107,.55)" : "none"
-				}
+				onMouseDown: function (e) { e.preventDefault(); },
+				onClick: function () { if (bus.mode) leave(); else enter(); },
+				title: !on ? "Voice mode — talk hands-free; replies are read aloud"
+					: muted ? "Voice mode on, mic muted — tap to leave voice mode"
+					: "Voice mode on: talk any time (a 2 s pause sends; talking while it works steers it). Tap to leave.",
+				"aria-label": on ? "Leave voice mode" : "Start voice mode",
+				"aria-pressed": on ? "true" : "false",
+				"data-voice-phase": !on ? "off" : muted ? "muted" : "on",
+				style: roundButton({
+					width: 32,
+					height: 32,
+					color: on ? "#ffffff" : "#111418",
+					background: on ? (muted ? "#8e3a3d" : "#e5484d") : "#f2f4f7",
+					animation: on && !muted && bus.speaking ? "dshVoicePulse 1.4s infinite" : "none"
+				})
 			},
-				h("svg", {
-					width: 15, height: 15, viewBox: "0 0 24 24",
-					fill: "none", stroke: "currentColor",
-					strokeWidth: 1.9, strokeLinecap: "round", strokeLinejoin: "round",
-					"aria-hidden": "true"
-				},
-					h("rect", { x: 9, y: 3, width: 6, height: 11, rx: 3 }),
-					h("path", { d: "M5 11a7 7 0 0 0 14 0" }),
-					h("path", { d: "M12 18v3" })
+				h("svg", { width: 16, height: 16, viewBox: "0 0 20 20", "aria-hidden": "true" },
+					bars.map(function (hgt, i) {
+						return h("rect", { key: i, x: 1.5 + i * 3.8, y: 10 - hgt / 2, width: 2.2, height: hgt, rx: 1.1, fill: "currentColor" });
+					})
 				)
 			);
 
-			// Absolutely positioned, so the hint cannot disturb composer layout.
-			var wrap = h("span", {
-				style: { position: "relative", display: "inline-flex", alignItems: "center" }
-			},
-				button,
-				msg && h("span", {
-					style: {
-						position: "absolute",
-						bottom: "calc(100% + 6px)",
-						right: 0,
-						whiteSpace: "nowrap",
-						fontSize: 11,
-						lineHeight: "16px",
-						padding: "2px 7px",
-						borderRadius: 6,
-						color: isRec ? "#ffd0d0" : "#b8c0cc",
-						background: "rgba(20,22,28,.92)",
-						border: "1px solid rgba(255,255,255,.09)",
-						pointerEvents: "none",
-						maxWidth: 300,
-						overflow: "hidden",
-						textOverflow: "ellipsis"
-					}
-				}, msg)
-			);
-
-			return wrap;
+			return h("span", { ref: rootRef, style: { position: "relative", display: "inline-flex", alignItems: "center", marginLeft: 4 } }, button, hintBubble(msg));
 		}
 
 		/** Required service: the UI slot registry. */
 		var inject = ["slots"];
 
 		/**
-		 * Mount the dictation control beside the composer's send controls.
+		 * Mount the mic (dictate) and the voice-mode button in the input bar.
 		 *
 		 * @param ctx - Client root context.
 		 */
 		function apply(ctx) {
 			ctx.slots.inject("conversation.input.right", function () {
-				return ctx.slots.register({
+				var offMic = ctx.slots.register({
 					name: "conversation.input.right",
 					id: "dictation",
 					order: 50
 				}, DictationButton);
+				var offVoice = ctx.slots.register({
+					name: "conversation.input.right",
+					id: "voice-mode",
+					order: 99
+				}, VoiceModeButton);
+				return function () { offMic(); offVoice(); };
 			});
 		}
 

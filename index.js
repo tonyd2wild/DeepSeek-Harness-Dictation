@@ -1,6 +1,9 @@
 /**
  * dsh-plugin-dictation — HOST half.
  *
+ * Runs inside the harness server: exposes the transcription routes and drives
+ * a local Whisper worker. The browser half (client.js) records the audio.
+ *
  * WHY THIS EXISTS
  *   The browser's own SpeechRecognition ships audio to Google and fails with a
  *   `network` error inside the Electron shell (no Google API key). So the page
@@ -10,18 +13,21 @@
  * ENGINE
  *   faster-whisper in its own venv (~/.dsh/dictation-venv), driven through
  *   worker.py: ONE long-lived child that keeps the model loaded. Spawning
- *   `python -m whisper` per request pays the model load every time (~6 s for a
- *   3 s clip on an M-series CPU); dictation wants the phrase back in about a
- *   second. The worker starts on the first dictation, not at boot, and dies
+ *   `python -m whisper` per request would pay the model load every time
+ *   (several seconds even for a short clip); dictation wants the phrase back
+ *   in about a second. The worker starts on the first dictation, not at boot, and dies
  *   with the harness (stdin closes) or when this plugin is disposed.
  *
  *   The interpreter is addressed by absolute path (the dedicated venv, or
  *   DSH_DICTATION_PYTHON), never whatever `python` happens to be on PATH.
  *
- * ROUTE
- *   POST /api/dictation/transcribe  { audio: <base64>, mime?: string, model?: string }
- *     -> { ok: true, text, model, seconds }
+ * ROUTES
+ *   POST /api/dictation/transcribe  { audio: <base64>, mime?: string, model?: string, fast?: boolean }
+ *     -> { ok: true, text, model, seconds, bytes, device }
  *     -> { ok: false, error }
+ *     fast: true = a live pass (base.en, greedy) unless `model` is given.
+ *   POST /api/dictation/warm  {}
+ *     -> { ok: true, warmed }   loads both models so the first words do not wait
  *   Same-origin, like the preview plugin's bridge, so no CORS and no token.
  *
  * SECURITY NOTE
@@ -47,6 +53,12 @@ export const inject = ['webServer']
 
 /** Exact path the browser half POSTs recorded audio to. */
 const TRANSCRIBE_PATH = '/api/dictation/transcribe'
+
+/** POSTed when a dictation starts, so the first live caption does not wait on a model load. */
+const WARM_PATH = '/api/dictation/warm'
+
+/** Live captions use a smaller English model with greedy decoding: several times faster, and redone every second anyway. */
+const CAPTION_MODEL = 'base.en'
 
 /** `small` is the latency/accuracy balance for dictation; pass `model` per request to override. */
 const DEFAULT_MODEL = 'small'
@@ -154,10 +166,10 @@ function ensureWorker() {
 }
 
 /**
- * Transcribe one file through the worker.
- * @returns {Promise<{text: string, seconds: number, device: string}>}
+ * Send one request to the worker and wait for its answer.
+ * @returns {Promise<object>}
  */
-async function transcribeFile(audioPath, model) {
+async function askWorker(fields) {
   const w = ensureWorker()
   const id = String(++nextId)
   let timer
@@ -172,7 +184,7 @@ async function transcribeFile(audioPath, model) {
   })
   try {
     await Promise.race([w.ready, timeout])
-    w.child.stdin.write(JSON.stringify({ id, audio: audioPath, model }) + '\n')
+    w.child.stdin.write(JSON.stringify({ id, ...fields }) + '\n')
     return await Promise.race([result, timeout])
   } finally {
     clearTimeout(timer)
@@ -215,9 +227,12 @@ export function apply(ctx) {
             return json(res, 413, { ok: false, error: 'audio-too-large', bytes: bytes.length })
           }
 
+          // fast = a LIVE CAPTION of the phrase so far (smaller model, greedy);
+          // otherwise the committed text of a finished phrase.
+          const fast = payload?.fast === true
           const model = typeof payload?.model === 'string' && ALLOWED_MODELS.has(payload.model)
             ? payload.model
-            : DEFAULT_MODEL
+            : (fast ? CAPTION_MODEL : DEFAULT_MODEL)
 
           dir = await mkdtemp(path.join(tmpdir(), 'dsh-dictation-'))
           // The browser records webm/opus; the worker decodes it itself (PyAV).
@@ -225,7 +240,7 @@ export function apply(ctx) {
           await writeFile(audioPath, bytes)
 
           const started = Date.now()
-          const out = await transcribeFile(audioPath, model)
+          const out = await askWorker({ audio: audioPath, model, fast })
 
           json(res, 200, {
             ok: true,
@@ -242,7 +257,20 @@ export function apply(ctx) {
         }
       }
     })
-    return () => { dispose(); killWorker() }
+    const disposeWarm = ctx.webServer.register({
+      kind: 'exact',
+      path: WARM_PATH,
+      handler: async (req, res) => {
+        if (req.method !== 'POST') return json(res, 405, { ok: false, error: 'method-not-allowed' })
+        try {
+          const out = await askWorker({ warm: [DEFAULT_MODEL, CAPTION_MODEL] })
+          json(res, 200, { ok: true, warmed: out.warmed })
+        } catch (e) {
+          json(res, 500, { ok: false, error: e?.message || 'warm-failed' })
+        }
+      }
+    })
+    return () => { dispose(); disposeWarm(); killWorker() }
   })
 }
 

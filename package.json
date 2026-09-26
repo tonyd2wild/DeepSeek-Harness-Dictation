@@ -1,7 +1,7 @@
 {
   "name": "dsh-plugin-dictation",
-  "version": "1.0.0",
-  "description": "Push-to-dictate microphone button for the DeepSeek Harness composer, transcribed locally by faster-whisper.",
+  "version": "2.0.0",
+  "description": "Live streaming dictation straight into the DeepSeek Harness message box, plus a hands-free voice mode (talk to send or steer), transcribed locally by faster-whisper.",
   "license": "MIT",
   "type": "module",
   "main": "index.js",

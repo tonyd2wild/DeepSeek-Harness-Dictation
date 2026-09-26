@@ -1,0 +1,28 @@
+{
+  "name": "dsh-plugin-dictation",
+  "version": "1.0.0",
+  "description": "Push-to-dictate microphone button for the DeepSeek Harness composer, transcribed locally by faster-whisper.",
+  "license": "MIT",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json"
+  },
+  "engines": {
+    "node": "^22.19.0 || >=24.0.0"
+  },
+  "dsh": {
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-runtime"
+      ],
+      "platform": "web"
+    }
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/tonyd2wild/DeepSeek-Harness-Dictation.git"
+  }
+}

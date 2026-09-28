@@ -248,6 +248,7 @@ window.__ModuleLoader__.load({
 		var PAUSE_MS = 650;          // silence that ends a phrase
 		var MAX_PHRASE_MS = 12000;   // force a cut in a long unbroken run
 		var TICK_MS = 80;            // voice-activity check interval
+		var RUN_GAP_MS = 250;        // a pause this long ends a run of voice (onVoice)
 		var LIVE_EVERY_MS = 700;     // live re-recognition interval
 		var SLICE_MS = 400;          // recorder slice length
 		var FINAL_MODEL = "base.en"; // "small" is more robust to accents/noise but ~5x slower on CPU
@@ -582,6 +583,13 @@ window.__ModuleLoader__.load({
 					if (speaking) {
 						live.lastVoiceAt = now;
 						if (p) p.hadSpeech = true;
+						// How long this run of voice has lasted (short gaps between
+						// syllables do not break it). Voice mode uses it to duck a
+						// reply the moment someone talks over it.
+						if (!live.runStart) live.runStart = now;
+						if (h.onVoice) h.onVoice(now - live.runStart);
+					} else if (live.runStart && now - live.lastVoiceAt > RUN_GAP_MS) {
+						live.runStart = 0;
 					}
 					var quietFor = now - live.lastVoiceAt;
 					if (p && p.hadSpeech && (quietFor >= PAUSE_MS || now - p.startedAt >= MAX_PHRASE_MS)) cutPhrase(true);
@@ -611,7 +619,9 @@ window.__ModuleLoader__.load({
 				maybeEnd();
 			});
 
-			return { stop: stop, setMuted: setMuted };
+			// poke(): recognise the current phrase NOW instead of on the next
+			// LIVE_EVERY_MS tick (barge-in wants the words as soon as they exist).
+			return { stop: stop, setMuted: setMuted, poke: refreshLive };
 		}
 
 		// ── the voice-mode bus (shared with dsh-plugin-speech) ───────────────
@@ -846,6 +856,21 @@ window.__ModuleLoader__.load({
 			});
 		}
 
+		/**
+		 * Voice-mode messages start with VOICE_MARKER so the agent knows its
+		 * reply will be HEARD (read aloud, possibly by an expressive voice that
+		 * takes [audio tags]) and can answer for the ear -- see the "Voice mode"
+		 * section of $DSH_HOME/AGENTS.md. Typed messages never carry it.
+		 */
+		var VOICE_MARKER = "🎙️ ";
+		function markSpoken() {
+			var el = findComposer();
+			if (!el) return Promise.resolve();
+			var text = composerText(el);
+			if (!text.trim() || text.indexOf(VOICE_MARKER.trim()) === 0) return Promise.resolve();
+			return Promise.resolve(replaceRange(el, 0, 0, VOICE_MARKER)).then(function () { return wait(40); }, function () {});
+		}
+
 		var styleInjected = false;
 		function injectComposerStyle() {
 			if (styleInjected) return;
@@ -870,17 +895,30 @@ window.__ModuleLoader__.load({
 		}
 
 		/**
-		 * Is `text` the mic hearing the reply being read? True when most of its
-		 * words occur in what is being read. Short fragments count as echo too:
-		 * one or two words during a reading are too ambiguous to act on.
+		 * Is `text` the mic hearing the reply being read?
+		 *   - "stop", "wait", "hold on" ... are never echo unless the reply
+		 *     itself says them: a short command is the most common interruption,
+		 *     and it used to be dropped as "too short to act on".
+		 *   - Three or more words that are NOT in the reply are the person
+		 *     talking, even when the mic also caught the reply underneath.
+		 *   - Otherwise: echo when most words occur in the reply, and one or two
+		 *     stray words are too ambiguous to act on.
 		 */
+		var BARGE_WORDS = ["stop", "wait", "hold", "hang", "pause", "enough", "quiet", "shush", "okay", "ok", "no", "hey", "actually", "sorry", "excuse"];
 		function looksLikeEcho(text, reading) {
 			var w = wordsOf(text);
 			if (!w.length) return true;
 			var pool = new Set(wordsOf(reading));
-			var hits = w.filter(function (x) { return pool.has(x); }).length;
-			return w.length <= 2 || hits / w.length >= 0.6;
+			var fresh = w.filter(function (x) { return !pool.has(x); });
+			if (fresh.some(function (x) { return BARGE_WORDS.indexOf(x) >= 0; })) return false;
+			if (fresh.length >= 3) return false;
+			return w.length <= 2 || (w.length - fresh.length) / w.length >= 0.6;
 		}
+
+		// Barge-in timing (voice mode).
+		var BARGE_DUCK_MS = 300;       // this much continuous voice over a reply ducks it
+		var BARGE_RELEASE_MS = 1500;   // ducked, then quiet this long without real words: restore
+		var DUCK_VOLUME = 0.15;
 
 		function VoiceModeButton() {
 			var bus = useVoiceBus();
@@ -915,7 +953,23 @@ window.__ModuleLoader__.load({
 
 			// Remember when reading ended: the speaker's tail can still reach the mic.
 			useEffect(function () {
-				return bus.on(function (type) { if (type === "spoken") readingEndedAt.current = Date.now(); });
+				return bus.on(function (type) {
+					if (type === "spoken") readingEndedAt.current = Date.now();
+					if (type === "spoken" || type === "stop-speaking") bus.ducked = false;
+				});
+			}, []);
+
+			// Barge-in, step 3: ducked but no real words came (echo, a cough, a
+			// door): bring the reading back to full volume.
+			useEffect(function () {
+				var t = setInterval(function () {
+					if (!bus.ducked) return;
+					if (!bus.speaking || Date.now() - (bus.lastVoiceAt || 0) > BARGE_RELEASE_MS) {
+						bus.ducked = false;
+						bus.emit("unduck");
+					}
+				}, 200);
+				return function () { clearInterval(t); };
 			}, []);
 
 			var leave = useCallback(function () {
@@ -936,6 +990,16 @@ window.__ModuleLoader__.load({
 					onListening: function () {},
 					onError: function (m) { setMsg(m); },
 					onEnd: function () { if (bus.mode) leave(); },   // the mic went away
+					// Barge-in, step 1: voice over a reply ducks it AT ONCE and asks
+					// for the words now. Step 2 (filter) stops it if they are real.
+					onVoice: function (runMs) {
+						bus.lastVoiceAt = Date.now();
+						if (!bus.speaking || bus.ducked || runMs < BARGE_DUCK_MS) return;
+						bus.ducked = true;
+						bus.duckVolume = DUCK_VOLUME;
+						bus.emit("duck");
+						if (ctlRef.current && ctlRef.current.poke) ctlRef.current.poke();
+					},
 					filter: function (text, final) {
 						var reading = bus.speaking || Date.now() - readingEndedAt.current < ECHO_GRACE_MS;
 						if (!reading) return text;
@@ -947,7 +1011,7 @@ window.__ModuleLoader__.load({
 					onUtterance: function () {
 						// The next finished reply is read aloud; mark it before sending.
 						bus.awaitingReply = true;
-						submitComposer().then(function (ok) {
+						markSpoken().then(submitComposer).then(function (ok) {
 							if (!ok) { bus.awaitingReply = false; setMsg("Could not send — press Enter"); }
 						});
 					}

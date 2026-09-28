@@ -1,6 +1,6 @@
 {
   "name": "dsh-plugin-dictation",
-  "version": "3.0.0",
+  "version": "3.1.0",
   "description": "Live streaming dictation straight into the DeepSeek Harness message box, plus a hands-free voice mode (talk to send or steer), transcribed locally by faster-whisper.",
   "license": "MIT",
   "type": "module",

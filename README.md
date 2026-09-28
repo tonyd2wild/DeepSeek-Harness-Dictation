@@ -68,20 +68,23 @@ How to use it:
 
 1. **Tap the voice button.** It turns red and stays red until you tap it again — the mic stays open the whole time.
 2. **Talk.** Your words stream into the box as usual.
-3. **Go quiet for 2 seconds** and what you said is sent. It is submitted with **Ctrl+Enter**, the harness's own gesture: a normal send when the agent is idle, a **steer** when it is busy — so talking while the agent works redirects it.
+3. **Go quiet for 2 seconds** and what you said is sent, starting with `🎙️ ` so the agent knows it was spoken and its reply will be heard (the Voice-Mode plugin's [expressive voice](https://github.com/tonyd2wild/DeepSeek-Harness-Voice-Mode#expressive-voice-elevenlabs-v4--audio-tags) setup uses this to have the agent answer for the ear, with emotion). It is submitted with **Ctrl+Enter**, the harness's own gesture: a normal send when the agent is idle, a **steer** when it is busy — so talking while the agent works redirects it.
 4. While voice mode is on, the **mic button becomes a mute toggle** (the microphone tracks are disabled while muted).
 5. **Tap the voice button again** to leave voice mode.
 
 Replies are read aloud by the companion **[DeepSeek-Harness-Voice-Mode](https://github.com/tonyd2wild/DeepSeek-Harness-Voice-Mode)** plugin. With it installed:
 
-- **Echo protection.** Phrases that mostly match the reply being read aloud — or 1–2 word fragments during a reading — are dropped, so the speaker can never steer the agent.
-- **Barge-in.** Real speech over a reading interrupts it.
+- **Echo protection.** Phrases that mostly match the reply being read aloud — or 1–2 stray word fragments during a reading — are dropped, so the speaker can never steer the agent.
+- **Barge-in, like ChatGPT.** Start talking over a reply and:
+  - it **ducks at once**: ~0.3 s of your voice drops the reading to 15 % volume (≈0.5 s from your first word), and the current phrase is recognised immediately instead of on the next caption tick;
+  - it **stops** as soon as the words are yours (≈1.1 s with the local recogniser). Short commands count — "stop", "wait", "hold on", "hang on", "okay", "no", "actually", "sorry" — unless the reply itself says them, and so do **three or more words that are not in the reply**, even when the mic also caught the reply underneath;
+  - **echo or noise** only ducks it; full volume returns after 1.5 s of quiet.
 
 Without the companion plugin, voice mode still sends and steers; replies just aren't spoken.
 
-The two plugins coordinate through a small shared object, `window.__dshVoice` (fields `mode`, `muted`, `awaitingReply`, `speaking`, `speakingText`; events `mode`, `mute`, `speaking`, `spoken`, `stop-speaking`), created by whichever plugin loads first.
+The two plugins coordinate through a small shared object, `window.__dshVoice` (fields `mode`, `muted`, `awaitingReply`, `speaking`, `speakingText`, `ducked`, `duckVolume`, `lastVoiceAt`; events `mode`, `mute`, `speaking`, `spoken`, `stop-speaking`, `duck`, `unduck`), created by whichever plugin loads first.
 
-**Tuning:** the send delay is `CONVO_SEND_AFTER_MS` in `client.js` (default `2000`). Raise it if voice mode sends in the middle of a thought.
+**Tuning** (in `client.js`): the send delay is `CONVO_SEND_AFTER_MS` (default `2000`); raise it if voice mode sends in the middle of a thought. Barge-in: `BARGE_DUCK_MS` (300), `BARGE_RELEASE_MS` (1500), `DUCK_VOLUME` (0.15), and the command words in `BARGE_WORDS`. The spoken-message marker is `VOICE_MARKER`.
 
 ## Models and latency
 
@@ -218,6 +221,7 @@ On a plain `<textarea>` (dsh 0.1) the same code still selects the stretch and us
 
 - **On dsh 0.2.0-rc.1**, on the real harness page with a fake microphone (Chromium `--use-file-for-fake-audio-capture`): words stream into the Lexical composer while talking, text typed beforehand is kept, both test sentences land verbatim and in order, the harness's Send button sees the text, dictation stops by itself after the silence, and nothing is sent — all passing.
 - On a test page in headless Chromium with a fake microphone: message then steer, auto-read, barge-in, mute, and leaving voice mode — all passing. On 0.2, voice mode sends with the same Ctrl+Enter gesture; that path has not yet been exercised in a live 0.2 session.
+- **Barge-in (this release)**, headless Chromium, fake microphone, both plugins, a recogniser answering in 800 ms: talking over a reply ducks it in ~0.5 s and stops it at ~1.1 s; echo-only ducks it, does not stop it, and restores full volume after quiet; unit checks that "stop", "wait", "hold on" and echo + three new words count as you, while echoed phrases stay echo — 13/13.
 
 ## Sibling projects
 

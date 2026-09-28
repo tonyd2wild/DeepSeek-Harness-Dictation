@@ -6,6 +6,8 @@
 
 **Live dictation straight into the DeepSeek Harness message box**, plus a **hands-free voice mode** for talking to the agent. Click the mic and your words appear in the composer as you speak, transcribed on your own computer by [faster-whisper](https://github.com/SYSTRAN/faster-whisper).
 
+**Requires dsh 0.2.0-rc.1 or newer.** Works in both dsh 0.2 surfaces: the web UI (`dsh web`) and DeepSeek's desktop app. Still on dsh 0.1.x? See [Using dsh 0.1.x?](#using-dsh-01x).
+
 ```
 🎙️ click → talk          →   "Open the preview pane and show me the latest build."   (words appear as you say them)
 🔊 tap voice mode → talk  →   a short pause sends it; talking while the agent works steers it
@@ -20,6 +22,20 @@ getUserMedia → MediaRecorder (webm/opus) → POST /api/dictation/transcribe �
 ```
 
 It behaves the same in a browser tab, in a desktop shell, and fully offline.
+
+## How this compares to the built-in voice input
+
+dsh 0.2 ships an **experimental voice input** of its own (`@deepseek-ai/dsh-experimental-voice-input-bundle`, local SenseVoice). It is **off by default**; you enable it from the Plugins page. It is a record-then-transcribe control: click the microphone, speak, click **Stop**, and the transcript is inserted into the draft. It also runs locally.
+
+This plugin works differently:
+
+- **Words stream into the box live** while you talk, instead of appearing after you press Stop.
+- **Hands-free voice mode**: a pause of about 2 s sends what you said, with no button press.
+- **Talk over the agent to steer it** while it is working.
+- **The mic becomes a mute toggle** in voice mode, so you can stay in the conversation without being heard.
+- Paired with [DeepSeek-Harness-Voice-Mode](https://github.com/tonyd2wild/DeepSeek-Harness-Voice-Mode), replies are read back to you.
+
+Pick whichever fits how you work.
 
 ## What you get
 
@@ -40,7 +56,7 @@ Click the mic — it turns red — and talk.
 
 How it works:
 
-- **The box is edited like a person would.** The harness composer is a plain controlled `<textarea>`. The plugin keeps track of the stretch of text *it* wrote and rewrites only the tail that changed: `setSelectionRange` over that part, then `document.execCommand("insertText")` — exactly what selecting text and typing over it does. React and the harness's own state follow along, and undo works. If you edit inside the dictated stretch mid-dictation, the plugin lets go of that text and carries on from the caret.
+- **The box is edited like a person would.** The plugin keeps track of the stretch of text *it* wrote and rewrites only the tail that changed, the way selecting text and typing over it would. The harness's own editor state follows along. If you edit inside the dictated stretch mid-dictation, the plugin lets go of that text and carries on from the caret. See [How insertion works](#how-insertion-works).
 - **Pause detection adapts to the room.** The room level is the 20th percentile of the last ~3 s of RMS, and speech is judged against it, so noise-suppressed or auto-gained microphones still show pauses.
 - **Each phrase is its own recorder.** A `MediaRecorder` only yields a decodable file from its own start, so every phrase gets a fresh recorder on the same microphone stream, recording in 400 ms slices. The slices so far always form a decodable (unterminated) webm, which is what the live pass transcribes.
 
@@ -73,13 +89,22 @@ Both passes use `base.en` by default (`FINAL_MODEL = "base.en"` in `client.js`).
 
 ## Requirements
 
-- A running dsh install (Node ≥ 22.19 or ≥ 24)
+- **dsh 0.2.0-rc.1 or newer** (Node ≥ 22.19 or ≥ 24)
 - **Python 3.9+** (3.11 recommended)
 - A microphone the harness page is allowed to use (see *Microphone permission* below)
 
 ffmpeg is **not** required: faster-whisper decodes webm/opus itself.
 
 ## Install
+
+dsh 0.2 installs plugins **per profile**. Each surface has its own profile:
+
+| you use | profile | profile folder |
+|---|---|---|
+| the web UI (`dsh web`) | `web` | `~/.dsh/profiles/web` |
+| DeepSeek's desktop app | `desktop` | `~/.dsh/profiles/desktop` |
+
+Install into whichever profile you use (or both — repeat steps 3–4 for each). There is no `settings.yaml` in 0.2: settings are rows in the profile's `cordis.patch.yml`, and upgrading from 0.1 migrates them there.
 
 ```bash
 # 1. clone next to your other plugins
@@ -91,18 +116,46 @@ git clone https://github.com/tonyd2wild/DeepSeek-Harness-Dictation.git ~/.dsh/pl
 #    macOS / Linux:  python3 -m venv ~/.dsh/dictation-venv
 #                    ~/.dsh/dictation-venv/bin/pip install -r ~/.dsh/plugins/dictation/requirements.txt
 
-# 3. wire it into dsh (host plane)
-dsh plugin --profile <your-profile> add link:~/.dsh/plugins/dictation
-#    then add a loader row to your profile's cordis.patch.yml, under `- insert:`
-#    - id: dsh-plugin-dictation
-#      name: 'dsh-plugin-dictation'
-
-# 4. restart the harness and reload the page. The mic and voice buttons appear in the composer.
-
-# 5. (optional, for spoken replies in voice mode) install DeepSeek-Harness-Voice-Mode the same way.
+# 3. link it into the profile (use `desktop` instead of `web` for the desktop app)
+dsh plugin --profile web add link:$HOME/.dsh/plugins/dictation
+#    Windows PowerShell:
+#    dsh plugin --profile web add "link:$env:USERPROFILE\.dsh\plugins\dictation"
 ```
 
+**4. Enable it** with a loader row in that profile's `cordis.patch.yml` (`~/.dsh/profiles/web/cordis.patch.yml` or `~/.dsh/profiles/desktop/cordis.patch.yml`). If the file already has a `- insert:` list, add the two lines to it; otherwise append:
+
+```yaml
+- insert:
+    - id: dsh-plugin-dictation
+      name: 'dsh-plugin-dictation'
+```
+
+**5. Restart.**
+
+- **Web UI:** stop `dsh web` and start it again, then open the `/?token=…` link it prints (0.2 asks each browser to log in once per address) or reload a tab that is already logged in.
+- **Desktop app:** quit the app completely and reopen it.
+
+The mic and voice buttons appear in the composer.
+
+**6. (optional)** For spoken replies in voice mode, install [DeepSeek-Harness-Voice-Mode](https://github.com/tonyd2wild/DeepSeek-Harness-Voice-Mode) the same way.
+
 The first use downloads the Whisper models (`base.en` is ~150 MB; `small` ~500 MB if you switch to it); after that everything is quick.
+
+> **Do not install a 0.1.x build of this plugin on dsh 0.2.** In 0.2 a client plugin that reads a service the page does not declare throws, and **one failing client plugin stops the whole UI from booting** ("Failed to load plugins"), not just the mic button. If the UI will not load after an install, remove the `dsh-plugin-dictation` row from `cordis.patch.yml`, restart, and install the current version.
+
+### Checking that it loaded
+
+In the browser's developer tools (Network tab), the browser half loads as `plugins/??dsh-plugin-dictation/client.js&rev=…`. The 0.1 path `/plugins/dsh-plugin-dictation/client.js` no longer exists in 0.2.
+
+## Using dsh 0.1.x?
+
+This version needs dsh 0.2.0-rc.1 or newer. The last release for dsh 0.1.x is preserved at the **`dsh-0.1`** tag:
+
+```bash
+git clone --branch dsh-0.1 https://github.com/tonyd2wild/DeepSeek-Harness-Dictation.git ~/.dsh/plugins/dictation
+```
+
+Follow the README at that tag to install it. When you upgrade dsh to 0.2, switch to the current version *before* you restart (see the warning above).
 
 ## Configuration
 
@@ -140,22 +193,31 @@ POST /api/dictation/warm         {}
 
 `/warm` loads both models into the worker. The browser fires it once when the button mounts, so the first words of the first dictation don't wait on a model load.
 
-Same-origin with the harness UI, so no CORS and no token. The upload is written to a temp file and only its path is passed to the worker — no user text reaches a shell. Uploads over 25 MB are refused.
+Same-origin with the harness UI, so no CORS and no extra token. The upload is written to a temp file and only its path is passed to the worker — no user text reaches a shell. Uploads over 25 MB are refused.
 
 ## Microphone permission
 
-- **Browser tab:** the browser asks once; allow it.
-- **Electron desktop shell:** the shell's main process must grant media permission to the harness origin (`session.setPermissionRequestHandler` / `setPermissionCheckHandler`). Without a handler, a mic request from an embedded view is not reliably granted and you get silence.
-  - **Windows:** also allow *Settings → Privacy & security → Microphone → Let desktop apps access your microphone*.
-  - **macOS:** the app needs a stable bundle id, `NSMicrophoneUsageDescription`, and the `com.apple.security.device.audio-input` entitlement, and the OS prompt should be raised on the user's mic click (`systemPreferences.askForMediaAccess`), not at startup — asking while the app is in the background records a silent denial. If *no* app on the Mac can get a mic prompt at all, check `nvram boot-args` for `amfi_get_out_of_my_way`: with AMFI disabled, macOS denies every new privacy prompt without showing it.
+- **Browser tab (web UI):** the browser asks once; allow it. Browsers only offer the microphone on HTTPS or on `localhost`/loopback addresses.
+- **Desktop app or another Electron shell:** the operating system has to allow the app to use the microphone.
+  - **Windows:** allow *Settings → Privacy & security → Microphone → Let desktop apps access your microphone*.
+  - **macOS:** allow the app under *System Settings → Privacy & Security → Microphone*. If *no* app on the Mac can get a mic prompt at all, check `nvram boot-args` for `amfi_get_out_of_my_way`: with AMFI disabled, macOS denies every new privacy prompt without showing it.
+  - **If you build your own Electron shell:** its main process must grant media permission to the harness origin (`session.setPermissionRequestHandler` / `setPermissionCheckHandler`); without a handler, a mic request from an embedded view is not reliably granted and you get silence. On macOS it also needs a stable bundle id, `NSMicrophoneUsageDescription`, the `com.apple.security.device.audio-input` entitlement, and should raise the OS prompt on the user's mic click (`systemPreferences.askForMediaAccess`), not at startup.
 
 ## How insertion works
 
-The composer is a plain controlled `<textarea>`, so the plugin edits it the way a person would: select the stretch it owns, then `document.execCommand("insertText")`. If the browser refuses that, it falls back to the native value setter plus a dispatched `input` event, so React still sees the change. Only the text the plugin wrote is ever rewritten.
+In dsh 0.2 the composer is a **Lexical rich-text editor** (a `contentEditable` marked `data-composer-input="true"`), not a `<textarea>`. Lexical ignores a synthetic `insertText` over a selection, so the plugin edits it with the two events Lexical does handle itself:
+
+1. select the stretch the plugin owns and dispatch a `beforeinput` event with `inputType: "deleteContentBackward"`;
+2. put the caret there and dispatch a `paste` `ClipboardEvent` carrying the new text.
+
+Offsets are measured over the editor's plain text. Edits are asynchronous, so they are serialised: while one write runs, newer text just marks the box dirty and the newest version is written next. Voice mode also waits for pending writes before it sends. Only the text the plugin wrote is ever rewritten.
+
+On a plain `<textarea>` (dsh 0.1) the same code still selects the stretch and uses `document.execCommand("insertText")`, falling back to the native value setter plus a dispatched `input` event.
 
 ## Testing
 
-Tested in headless Chromium with a fake microphone (`--use-file-for-fake-audio-capture`): words stream into the box, pre-typed text is preserved, message then steer, auto-read, barge-in, mute, and leaving voice mode — all passing.
+- **On dsh 0.2.0-rc.1**, on the real harness page with a fake microphone (Chromium `--use-file-for-fake-audio-capture`): words stream into the Lexical composer while talking, text typed beforehand is kept, both test sentences land verbatim and in order, the harness's Send button sees the text, dictation stops by itself after the silence, and nothing is sent — all passing.
+- On a test page in headless Chromium with a fake microphone: message then steer, auto-read, barge-in, mute, and leaving voice mode — all passing. On 0.2, voice mode sends with the same Ctrl+Enter gesture; that path has not yet been exercised in a live 0.2 session.
 
 ## Sibling projects
 

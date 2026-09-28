@@ -1,7 +1,9 @@
 /**
  * dsh-plugin-dictation — BROWSER half.
  *
- * Served at /plugins/dsh-plugin-dictation/client.js by the host's client-modules
+ * Requires dsh 0.2.0-rc.1 or newer (0.1.x builds live on the dsh-0.1 tag).
+ *
+ * Served at plugins/??dsh-plugin-dictation/client.js by the host's client-modules
  * scanner (package.json declares dsh.client.platform "web") and injected via
  * window.__DSH_BOOT__. Executing it only REGISTERS a factory through
  * window.__ModuleLoader__.load({id, factory}).
@@ -34,10 +36,15 @@
  *   window.__dshVoice. See "voice mode" below.
  *
  * INSERTION
- *   Writing into another package's composer is the fragile part. The engine
- *   selects the stretch it owns and uses document.execCommand("insertText");
- *   if that is refused it falls back to the native value setter plus a
- *   dispatched "input" event, so React still sees the change. The v1 layered
+ *   Writing into another package's composer is the fragile part. In dsh 0.2
+ *   the composer is a Lexical contentEditable ([data-composer-input="true"]),
+ *   which ignores a synthetic insertText over a selection. The engine therefore
+ *   selects the stretch it owns, deletes it with a `beforeinput`
+ *   deleteContentBackward, and pastes the new text with a ClipboardEvent;
+ *   Lexical applies both itself. Writes are serialised so they never overlap.
+ *   On a plain <textarea> (dsh 0.1) it still selects the stretch and uses
+ *   document.execCommand("insertText"), falling back to the native value
+ *   setter plus a dispatched "input" event. The v1 layered
  *   helpers (session event bus "slash/input-insert-text", then execCommand,
  *   then the native setter) are still defined below.
  *
@@ -100,6 +107,12 @@ window.__ModuleLoader__.load({
 		 * a candidate, and the LAST match in document order is the best guess.
 		 */
 		function findComposer() {
+			// dsh 0.2: the composer is a Lexical contentEditable marked data-composer-input.
+			var marked = document.querySelectorAll('[data-composer-input="true"]');
+			for (var k = marked.length - 1; k >= 0; k--) {
+				var mr = marked[k].getBoundingClientRect();
+				if (mr.width > 0 && mr.height > 0) return marked[k];
+			}
 			var nodes = document.querySelectorAll('[contenteditable="true"], textarea');
 			var best = null;
 			for (var i = 0; i < nodes.length; i++) {
@@ -268,8 +281,76 @@ window.__ModuleLoader__.load({
 			return seconds < 2.5 && HALLUCINATIONS.indexOf(String(text).trim().toLowerCase()) >= 0;
 		}
 
-		/** Replace [from, to) of a textarea the way a person would: select, type over. */
+		/** Plain text of the composer, the coordinate space all offsets use. */
+		function composerText(el) {
+			return el.isContentEditable ? (el.textContent || "") : (el.value || "");
+		}
+
+		/** Where the caret is, as a text offset (end of text if it is elsewhere). */
+		function caretOffset(el) {
+			if (!el.isContentEditable) return typeof el.selectionEnd === "number" ? el.selectionEnd : el.value.length;
+			var sel = window.getSelection();
+			if (sel && sel.rangeCount && el.contains(sel.focusNode)) {
+				var r = document.createRange();
+				r.selectNodeContents(el);
+				r.setEnd(sel.focusNode, sel.focusOffset);
+				return r.toString().length;
+			}
+			return composerText(el).length;
+		}
+
+		/** Text offset -> DOM position inside a contentEditable. */
+		function domPos(root, off) {
+			var w = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+			var n, last = null;
+			while ((n = w.nextNode())) {
+				last = n;
+				if (off <= n.data.length) return [n, off];
+				off -= n.data.length;
+			}
+			return last ? [last, last.data.length] : [root, root.childNodes.length];
+		}
+
+		function selectText(el, from, to) {
+			var a = domPos(el, from), b = domPos(el, to);
+			var r = document.createRange();
+			r.setStart(a[0], a[1]);
+			r.setEnd(b[0], b[1]);
+			var sel = window.getSelection();
+			sel.removeAllRanges();
+			sel.addRange(r);
+			document.dispatchEvent(new Event("selectionchange"));
+		}
+
+		function wait(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
+
+		/**
+		 * Replace [from, to) of the composer the way a person would.
+		 * textarea (dsh 0.1): select + execCommand("insertText").
+		 * contentEditable/Lexical (dsh 0.2): delete the old stretch with a
+		 * deleteContentBackward beforeinput, then PASTE the new text at that spot.
+		 * Lexical applies both itself; a synthetic insertText over a selection is
+		 * left to the browser and does nothing, which is why it is not used.
+		 */
 		function replaceRange(el, from, to, text) {
+			if (el.isContentEditable) {
+				return (async function () {
+					if (to > from) {
+						selectText(el, from, to);
+						await wait(30);
+						el.dispatchEvent(new InputEvent("beforeinput", { inputType: "deleteContentBackward", bubbles: true, cancelable: true }));
+						await wait(40);
+					}
+					if (text) {
+						selectText(el, from, from);
+						await wait(30);
+						var dt = new DataTransfer();
+						dt.setData("text/plain", text);
+						el.dispatchEvent(new ClipboardEvent("paste", { clipboardData: dt, bubbles: true, cancelable: true }));
+						await wait(40);
+					}
+				})();
+			}
 			el.focus({ preventScroll: true });
 			el.setSelectionRange(from, to);
 			var ok = false;
@@ -284,27 +365,29 @@ window.__ModuleLoader__.load({
 				el.setSelectionRange(from + text.length, from + text.length);
 				el.dispatchEvent(new Event("input", { bubbles: true, composed: true }));
 			}
+			return Promise.resolve();
 		}
 
 		/**
 		 * Make the stretch this dictation owns read `desired`, changing only the
 		 * part that differs so the caret and the rest of the text stay put.
+		 * Returns a promise of true/false (false = no composer found).
 		 */
 		function writeOwned(live, desired) {
 			var el = live.box && document.contains(live.box) ? live.box : findComposer();
-			if (!el || typeof el.setSelectionRange !== "function") return false;
+			if (!el || (!el.isContentEditable && typeof el.setSelectionRange !== "function")) return Promise.resolve(false);
 			if (el !== live.box) {
 				// First write (or the composer was re-mounted): anchor at the caret.
 				live.box = el;
-				live.anchor = typeof el.selectionEnd === "number" ? el.selectionEnd : el.value.length;
+				live.anchor = caretOffset(el);
 				live.written = "";
-				live.lead = live.anchor > 0 && !/\s$/.test(el.value.slice(0, live.anchor)) ? " " : "";
+				live.lead = live.anchor > 0 && !/\s$/.test(composerText(el).slice(0, live.anchor)) ? " " : "";
 			}
-			var cur = el.value;
+			var cur = composerText(el);
 			if (cur.substr(live.anchor, live.written.length) !== live.written) {
 				// The human edited inside our stretch (or the box was sent/cleared):
 				// leave it to them and carry on from wherever the caret is now.
-				live.anchor = typeof el.selectionEnd === "number" ? el.selectionEnd : cur.length;
+				live.anchor = caretOffset(el);
 				live.written = "";
 				live.lead = live.anchor > 0 && !/\s$/.test(cur.slice(0, live.anchor)) ? " " : "";
 				live.parts = [];
@@ -314,10 +397,10 @@ window.__ModuleLoader__.load({
 			var common = 0;
 			var max = Math.min(target.length, live.written.length);
 			while (common < max && target.charCodeAt(common) === live.written.charCodeAt(common)) common++;
-			if (common === target.length && common === live.written.length) return true;
-			replaceRange(el, live.anchor + common, live.anchor + live.written.length, target.slice(common));
+			if (common === target.length && common === live.written.length) return Promise.resolve(true);
+			var from = live.anchor + common, to = live.anchor + live.written.length, text = target.slice(common);
 			live.written = target;
-			return true;
+			return replaceRange(el, from, to, text).then(function () { return true; });
 		}
 
 		/**
@@ -356,13 +439,32 @@ window.__ModuleLoader__.load({
 				if (h.onEnd) h.onEnd({ said: live.said });
 			}
 
-			function render() {
+			function desiredText() {
 				var texts = live.parts.map(function (p) { return p.text; });
 				if (live.phrase && live.phrase.text) texts.push(live.phrase.text);
 				var desired = texts.filter(Boolean).join(" ");
 				if (desired) live.said = true;
-				if (!writeOwned(live, desired) && h.onError) h.onError("Could not reach the message box");
+				return desired;
+			}
+
+			/**
+			 * Bring the box up to date. Writes are async on dsh 0.2's editor, so
+			 * they are serialised: while one runs, later changes just mark the box
+			 * dirty and the loop writes the newest text once it finishes.
+			 */
+			function render() {
+				live.dirty = true;
 				if (h.onPending) h.onPending(pendingCount());
+				if (live.flushing) return;
+				live.flushing = true;
+				(async function () {
+					while (live.dirty) {
+						live.dirty = false;
+						var ok = await writeOwned(live, desiredText());
+						if (!ok && h.onError) h.onError("Could not reach the message box");
+					}
+					live.flushing = false;
+				})();
 			}
 
 			/** Continuous mode: the stretch was sent; the next words start a new one. */
@@ -490,7 +592,7 @@ window.__ModuleLoader__.load({
 					// Continuous: done talking = quiet long enough, nothing still
 					// being recorded or finalised, and something was actually said.
 					var p2 = live.phrase;
-					if (live.said && quietFor >= sendAfterMs && !(p2 && p2.hadSpeech) && pendingCount() === 0) {
+					if (live.said && quietFor >= sendAfterMs && !(p2 && p2.hadSpeech) && pendingCount() === 0 && !live.flushing) {
 						var fire = h.onUtterance;
 						newStretch();
 						if (fire) fire();
@@ -730,13 +832,13 @@ window.__ModuleLoader__.load({
 			return new Promise(function (resolve) {
 				var el = findComposer();
 				if (!el) { resolve(false); return; }
-				var before = el.value;
+				var before = composerText(el);
 				el.dispatchEvent(new KeyboardEvent("keydown", {
 					key: "Enter", code: "Enter", keyCode: 13, which: 13, ctrlKey: true, bubbles: true, cancelable: true
 				}));
 				setTimeout(function () {
 					var now = findComposer();
-					if (!now || now.value !== before || !now.value.trim()) { resolve(true); return; }
+					if (!now || composerText(now) !== before || !composerText(now).trim()) { resolve(true); return; }
 					var b = findSendButton();
 					if (b && !b.disabled) { b.click(); resolve(true); return; }
 					resolve(false);
@@ -759,7 +861,7 @@ window.__ModuleLoader__.load({
 
 		function composerEmpty() {
 			var el = findComposer();
-			return !el || !String(el.value || el.textContent || "").trim();
+			return !el || !composerText(el).trim();
 		}
 
 		/** Words, lower-cased, no punctuation. */
